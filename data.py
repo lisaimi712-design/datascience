@@ -31,9 +31,18 @@ class AfricanNewsCollector:
         
         # African countries list
         self.african_countries = [
-            'Nigeria', 'South Africa', 'Kenya', 'Egypt', 'Ghana', 'Ethiopia',
-            'Tanzania', 'Uganda', 'Morocco', 'Angola', 'Sudan', 'Namibia',
-            'Mozambique', 'Cameroon', 'Rwanda', 'Senegal', 'Zimbabwe', 'Sierra Leone', 'Burkina Faso'
+    'Algeria', 'Egypt', 'Libya', 'Morocco', 'Sudan', 'Tunisia', 'Western Sahara',     
+    'Benin', 'Burkina Faso', 'Cape Verde', 'Ivory Coast', 'Gambia', 'Ghana',
+    'Guinea', 'Guinea-Bissau', 'Liberia', 'Mali', 'Mauritania', 'Niger',
+    'Nigeria', 'Senegal', 'Sierra Leone', 'Togo',
+    'Angola', 'Cameroon', 'Central African Republic', 'Chad', 'Republic of the Congo',
+    'Democratic Republic of the Congo', 'Equatorial Guinea', 'Gabon', 
+    'Sao Tome and Principe',
+    'Burundi', 'Comoros', 'Djibouti', 'Eritrea', 'Ethiopia', 'Kenya',
+    'Madagascar', 'Malawi', 'Mauritius', 'Mozambique', 'Reunion', 'Rwanda',
+    'Seychelles', 'Somalia', 'South Sudan', 'Tanzania', 'Uganda', 'Zambia',
+    'Zimbabwe',
+        'Botswana', 'Eswatini', 'Lesotho', 'Namibia', 'South Africa',
         ]
         
         # Topics of interest
@@ -638,8 +647,8 @@ class AfricanNewsCollector:
 
 if __name__ == "__main__":
     # Initialize collector
-    NEWSAPI_KEY = "your_newsapi_key_here"  # Replace with your actual key
-    MEDIACLOUD_KEY = None  # Optional: add if you have access
+    NEWSAPI_KEY = "2cf75fc6d6de4e348a75c2d85a52ba57"  
+    MEDIACLOUD_KEY = "ed2d3b284b34b9a58b71c7f1916422054d402648"  
     
     collector = AfricanNewsCollector(
         newsapi_key=NEWSAPI_KEY,
@@ -647,8 +656,11 @@ if __name__ == "__main__":
     )
     
     # Define parameters
-    selected_countries = ['Nigeria', 'Kenya', 'South Africa', 'Ghana']
-    selected_topics = ['infrastructure', 'investment', 'economy']
+    selected_countries = ['Nigeria', 'South Africa', 'Kenya', 'Egypt', 'Ghana', 'Ethiopia',
+            'Tanzania', 'Uganda', 'Morocco', 'Angola', 'Sudan', 'Namibia',
+            'Mozambique', 'Cameroon', 'Rwanda', 'Senegal', 'Zimbabwe', 'Sierra Leone', 'Burkina Faso']
+    selected_topics = [ 'infrastructure', 'investment', 'economy', 'health', 'education',
+            'energy', 'agriculture', 'technology', 'politics', 'trade']
     
     # Collect data from all sources
     data = collector.collect_all_sources(
