@@ -7,6 +7,10 @@ from typing import List, Dict, Optional
 import json
 import itertools
 import logging
+import xml.etree.ElementTree as ET
+from html import unescape
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 try:
     import feedparser
     HAVE_FEEDPARSER = True
@@ -42,13 +46,13 @@ class AfricanNewsCollector:
     'Madagascar', 'Malawi', 'Mauritius', 'Mozambique', 'Reunion', 'Rwanda',
     'Seychelles', 'Somalia', 'South Sudan', 'Tanzania', 'Uganda', 'Zambia',
     'Zimbabwe',
-        'Botswana', 'Eswatini', 'Lesotho', 'Namibia', 'South Africa',
+    'Botswana', 'Eswatini', 'Lesotho', 'Namibia', 'South Africa',
         ]
         
         # Topics of interest
         self.topics = [
-            'infrastructure', 'investment', 'economy', 'health', 'education',
-            'energy', 'agriculture', 'technology', 'politics', 'trade'
+            'infrastructure', 'investment', 'economy', 'health', 'education', 'hunger', 'aids'
+            'energy', 'agriculture', 'technology', 'politics', 'trade','oil', 'mining', 'transportation'
         ]
         
          # African news sources with RSS feeds
@@ -103,8 +107,8 @@ class AfricanNewsCollector:
     def collect_newsapi_data(self, 
                             countries: Optional[List[str]] = None,
                             topics: Optional[List[str]] = None,
-                            days_back: int = 30,
-                            language: str = 'en',
+                            days_back: int = 36000,
+                            language: str = 'en,af,fr',
                             attempts_per_window: int = 50,
                             window_hours: int = 12,
                             state_path: str = 'newsapi_state.json') -> pd.DataFrame:
@@ -246,8 +250,8 @@ class AfricanNewsCollector:
     def schedule_newsapi_collection(self,
                                     countries: Optional[List[str]] = None,
                                     topics: Optional[List[str]] = None,
-                                    days_back: int = 30,
-                                    language: str = 'en',
+                                    days_back: int = 36000,
+                                    language: str = 'en,af,fr',
                                     attempts_per_window: int = 50,
                                     window_hours: int = 12,
                                     state_path: str = 'newsapi_state.json',
@@ -325,16 +329,7 @@ class AfricanNewsCollector:
     
     def collect_mediacloud_data(self,
                                 query: str,
-                                days_back: int = 30) -> pd.DataFrame:
-        """
-        Collect from MediaCloud (requires API key)
-        Note: MediaCloud deprecated their public API in 2023, but you can use their web interface
-        or contact them for research access
-        
-        Args:
-            query: Search query
-            days_back: Days to look back
-        """
+                                days_back: int = 36000) -> pd.DataFrame:
         if not self.mediacloud_key:
             print("MediaCloud API key not provided. Skipping MediaCloud collection.")
             return pd.DataFrame()
@@ -378,7 +373,7 @@ class AfricanNewsCollector:
     def collect_gdelt_data(self,
                           countries: Optional[List[str]] = None,
                           topics: Optional[List[str]] = None,
-                          days_back: int = 7) -> pd.DataFrame:
+                          days_back: int = 36000) -> pd.DataFrame:
         """
         Collect from GDELT using their GKG (Global Knowledge Graph) API
         GDELT is free and doesn't require API key
@@ -436,7 +431,7 @@ class AfricanNewsCollector:
                                 'published_at': article.get('seendate'),
                                 'domain': article.get('domain'),
                                 'language': article.get('language'),
-                                'tone': article.get('tone')  # GDELT provides sentiment tone
+                                'tone': article.get('tone') 
                             })
                     
                     # Be respectful with GDELT API
@@ -446,10 +441,109 @@ class AfricanNewsCollector:
                     print(f"GDELT error for {country}-{topic}: {str(e)}")
         
         return pd.DataFrame(all_articles)
+
+    def _parse_rss_with_requests(self, rss_url: str, max_articles: int = 1000) -> List[Dict]:
+        """Fallback RSS parser using requests + ElementTree.
+
+        Returns list of article dicts with keys: title, link, description, published_at
+        """
+        entries = []
+
+        # Use a browser-like User-Agent and simple retry/backoff to reduce rejections
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                          '(KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36'
+        }
+        attempts = 3
+        backoff = 1.0
+        content = None
+        for attempt in range(attempts):
+            try:
+                resp = requests.get(rss_url, timeout=10, headers=headers)
+                resp.raise_for_status()
+                content = resp.content
+                break
+            except Exception as e:
+                logger.debug("Attempt %d failed fetching %s: %s", attempt + 1, rss_url, e)
+                time.sleep(backoff)
+                backoff *= 2
+
+        if content is None:
+            logger.warning("Failed to fetch RSS %s after %d attempts", rss_url, attempts)
+            return entries
+
+        # Parse XML; try decode/unescape if raw parse fails
+        try:
+            root = ET.fromstring(content)
+        except Exception as e:
+            try:
+                text = content.decode('utf-8', errors='replace')
+                text = unescape(text)
+                root = ET.fromstring(text)
+            except Exception:
+                logger.warning("Failed to parse XML from %s: %s", rss_url, e)
+                return entries
+
+        # Find item elements (RSS) or entry elements (Atom)
+        items = root.findall('.//item')
+        if not items:
+            items = root.findall('.//{http://www.w3.org/2005/Atom}entry') or root.findall('.//entry')
+
+        def _get_text(elem, names):
+            if elem is None:
+                return None
+            for child in list(elem):
+                tag = child.tag
+                # strip namespace if present
+                if '}' in tag:
+                    tag = tag.rsplit('}', 1)[1]
+                if tag in names:
+                    # join text including nested tags
+                    # If the link is an element with href attribute (Atom), return that
+                    href = child.attrib.get('href') if hasattr(child, 'attrib') else None
+                    if href:
+                        return href
+                    return ''.join(child.itertext()).strip()
+            # fallback: check direct text if elem itself matches
+            tag = elem.tag
+            if '}' in tag:
+                tag = tag.rsplit('}', 1)[1]
+            if tag in names:
+                return ''.join(elem.itertext()).strip()
+            return None
+
+        for it in items:
+            if len(entries) >= max_articles:
+                break
+
+            title = _get_text(it, {'title'}) or ''
+            link = _get_text(it, {'link', 'id'}) or ''
+            # For Atom, sometimes the link is present as <link href="..."/>
+            if not link:
+                # check attributes on the element itself (e.g., <link href=...>)
+                l = it.attrib.get('href') if hasattr(it, 'attrib') else None
+                if l:
+                    link = l
+            description = _get_text(it, {'description', 'summary', 'content'}) or ''
+            pub = _get_text(it, {'pubDate', 'published', 'updated'}) or None
+
+            # Unescape HTML entities
+            title = unescape(title)
+            description = unescape(description)
+
+            entries.append({
+                'title': title,
+                'link': link,
+                'description': description,
+                'published_at': pub
+            })
+
+        return entries
     
     def collect_african_rss_feeds(self,
                                   sources: Optional[List[str]] = None,
-                                  max_articles_per_source: int = 100) -> pd.DataFrame:
+                                  max_articles_per_source: int = 1000,
+                                  days_back: Optional[int] = None) -> pd.DataFrame:
         """
         Collect articles from African news sources via RSS feeds
         This provides LOCAL African coverage without API limits!
@@ -462,6 +556,9 @@ class AfricanNewsCollector:
             DataFrame with collected articles
         """
         all_articles = []
+        use_feedparser = HAVE_FEEDPARSER and feedparser is not None
+        if not use_feedparser:
+            logger.info("'feedparser' not available — using fallback parser (requests + ElementTree)")
         
         # Select sources
         if sources is None:
@@ -472,48 +569,109 @@ class AfricanNewsCollector:
         
         print(f"Collecting from {len(sources_to_fetch)} African news sources...")
         
+        # compute cutoff if days_back provided
+        cutoff = None
+        if days_back is not None:
+            cutoff = datetime.now() - timedelta(days=days_back)
+
         for source_name, rss_url in sources_to_fetch.items():
             try:
                 print(f"  Fetching: {source_name}")
-                
-                # Parse RSS feed
-                feed = feedparser.parse(rss_url)
-                
-                # Get articles
+
                 articles_collected = 0
-                for entry in feed.entries:
-                    if articles_collected >= max_articles_per_source:
-                        break
-                    
-                    # Extract publication date
-                    pub_date = None
-                    if hasattr(entry, 'published_parsed'):
-                        pub_date = datetime(*entry.published_parsed[:6])
-                    elif hasattr(entry, 'updated_parsed'):
-                        pub_date = datetime(*entry.updated_parsed[:6])
-                    
-                    # Extract description/summary
-                    description = None
-                    if hasattr(entry, 'summary'):
-                        description = entry.summary
-                    elif hasattr(entry, 'description'):
-                        description = entry.description
-                    
-                    all_articles.append({
-                        'source': 'African RSS',
-                        'source_name': source_name,
-                        'title': entry.get('title', ''),
-                        'description': description,
-                        'url': entry.get('link', ''),
-                        'published_at': pub_date,
-                        'language': 'unknown'  # Will need language detection
-                    })
-                    
-                    articles_collected += 1
-                
+
+                if use_feedparser:
+                    feed = feedparser.parse(rss_url)
+                    for entry in feed.entries:
+                        if articles_collected >= max_articles_per_source:
+                            break
+
+                        # Extract publication date
+                        pub_date = None
+                        if getattr(entry, 'published_parsed', None):
+                            pp = entry.published_parsed
+                            try:
+                                pub_date = datetime(*pp[:6])
+                            except Exception:
+                                pub_date = None
+                        elif getattr(entry, 'updated_parsed', None):
+                            up = entry.updated_parsed
+                            try:
+                                pub_date = datetime(*up[:6])
+                            except Exception:
+                                pub_date = None
+
+                        # If entry has string fields, try to coerce
+                        if pub_date is None:
+                            pub_str = entry.get('published') or entry.get('updated') or None
+                            if pub_str:
+                                try:
+                                    pub_date = pd.to_datetime(pub_str, errors='coerce')
+                                    if pd.isna(pub_date):
+                                        pub_date = None
+                                except Exception:
+                                    pub_date = None
+
+                        # Extract description/summary
+                        description = None
+                        if hasattr(entry, 'summary'):
+                            description = entry.summary
+                        elif hasattr(entry, 'description'):
+                            description = entry.description
+
+                        all_articles.append({
+                            'source': 'African RSS',
+                            'source_name': source_name,
+                            'title': entry.get('title', ''),
+                            'description': description,
+                            'url': entry.get('link', ''),
+                            'published_at': pub_date,
+                            'language': 'unknown'
+                        })
+
+                        # filter by days_back if requested
+                        if cutoff is not None:
+                            pub_dt = pd.to_datetime(pub_date, errors='coerce')
+                            if pd.isna(pub_dt) or pub_dt < cutoff:
+                                # remove the article we just appended
+                                all_articles.pop()
+                                continue
+
+                        articles_collected += 1
+
+                else:
+                    # Use fallback parser that returns simple dicts
+                    parsed = self._parse_rss_with_requests(rss_url, max_articles_per_source)
+                    for item in parsed:
+                        if articles_collected >= max_articles_per_source:
+                            break
+                        # coerce published_at to datetime if string-like
+                        pub_val = item.get('published_at')
+                        try:
+                            pub_dt = pd.to_datetime(pub_val, errors='coerce')
+                        except Exception:
+                            pub_dt = None
+
+                        all_articles.append({
+                            'source': 'African RSS',
+                            'source_name': source_name,
+                            'title': item.get('title', ''),
+                            'description': item.get('description', ''),
+                            'url': item.get('link', ''),
+                            'published_at': pub_dt,
+                            'language': 'unknown'
+                        })
+
+                        # filter by days_back if requested
+                        if cutoff is not None:
+                            if pd.isna(pub_dt) or pub_dt < cutoff:
+                                all_articles.pop()
+                                continue
+                        articles_collected += 1
+
                 print(f"    Collected {articles_collected} articles")
-                time.sleep(0.5)  # Be respectful to servers
-                
+                time.sleep(0.5)
+
             except Exception as e:
                 print(f"    Error fetching {source_name}: {str(e)}")
         
@@ -524,7 +682,7 @@ class AfricanNewsCollector:
     def collect_all_sources(self,
                            countries: Optional[List[str]] = None,
                            topics: Optional[List[str]] = None,
-                           days_back: int = 7,
+                           days_back: int = 36000,
                            include_rss: bool = True,
                            save_path: Optional[str] = None,
                            master_path: Optional[str] = None) -> pd.DataFrame:
@@ -632,11 +790,8 @@ class AfricanNewsCollector:
         # Remove duplicates
         df = df.drop_duplicates(subset=['title'])
         
-        # Add text length
+        # Add text length (kept for diagnostics) but do NOT drop short titles
         df['title_length'] = df['title'].str.len()
-        
-        # Filter out very short titles (likely incomplete)
-        df = df[df['title_length'] > 20]
         
         print(f"Preprocessed data: {len(df)} articles remaining")
         
@@ -656,9 +811,18 @@ if __name__ == "__main__":
     )
     
     # Define parameters
-    selected_countries = ['Nigeria', 'South Africa', 'Kenya', 'Egypt', 'Ghana', 'Ethiopia',
-            'Tanzania', 'Uganda', 'Morocco', 'Angola', 'Sudan', 'Namibia',
-            'Mozambique', 'Cameroon', 'Rwanda', 'Senegal', 'Zimbabwe', 'Sierra Leone', 'Burkina Faso']
+    selected_countries = [    'Algeria', 'Egypt', 'Libya', 'Morocco', 'Sudan', 'Tunisia', 'Western Sahara',     
+    'Benin', 'Burkina Faso', 'Cape Verde', 'Ivory Coast', 'Gambia', 'Ghana',
+    'Guinea', 'Guinea-Bissau', 'Liberia', 'Mali', 'Mauritania', 'Niger',
+    'Nigeria', 'Senegal', 'Sierra Leone', 'Togo',
+    'Angola', 'Cameroon', 'Central African Republic', 'Chad', 'Republic of the Congo',
+    'Democratic Republic of the Congo', 'Equatorial Guinea', 'Gabon', 
+    'Sao Tome and Principe',
+    'Burundi', 'Comoros', 'Djibouti', 'Eritrea', 'Ethiopia', 'Kenya',
+    'Madagascar', 'Malawi', 'Mauritius', 'Mozambique', 'Reunion', 'Rwanda',
+    'Seychelles', 'Somalia', 'South Sudan', 'Tanzania', 'Uganda', 'Zambia',
+    'Zimbabwe',
+    'Botswana', 'Eswatini', 'Lesotho', 'Namibia', 'South Africa',]
     selected_topics = [ 'infrastructure', 'investment', 'economy', 'health', 'education',
             'energy', 'agriculture', 'technology', 'politics', 'trade']
     
@@ -666,22 +830,34 @@ if __name__ == "__main__":
     data = collector.collect_all_sources(
         countries=selected_countries,
         topics=selected_topics,
-        days_back=7,  # Start with 7 days for testing
+        days_back=36000, 
         save_path='african_news_data.csv'
     )
     
     # Preprocess
     clean_data = collector.preprocess_data(data)
-    
+    # Ensure 'country' column exists (RSS and some sources may not set it)
+    if 'country' not in clean_data.columns:
+        clean_data['country'] = None
+
     # Display summary
     print("\n" + "=" * 60)
     print("DATA COLLECTION SUMMARY")
     print("=" * 60)
     print(f"Total articles: {len(clean_data)}")
     print(f"\nArticles by source:")
-    print(clean_data['source'].value_counts())
+    if 'source' in clean_data.columns:
+        print(clean_data['source'].value_counts())
+    else:
+        print('No source information available')
+
     print(f"\nArticles by country:")
-    print(clean_data['country'].value_counts())
+    # show counts including NaN (as 'Unknown')
+    try:
+        print(clean_data['country'].fillna('Unknown').value_counts())
+    except Exception:
+        print('Could not compute country counts')
+
     print(f"\nDate range: {clean_data['published_at'].min()} to {clean_data['published_at'].max()}")
     
     # Save preprocessed data
