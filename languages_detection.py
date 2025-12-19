@@ -1,10 +1,68 @@
+import os
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple
-import matplotlib.pyplot as plt
-import seaborn as sns
-from langdetect import detect, detect_langs, LangDetectException
+# visualization libraries are imported only when needed (optional)
+# Try to import langdetect; if unavailable provide a lightweight fallback
+try:
+    from langdetect import detect, detect_langs, LangDetectException
+except Exception:
+    class LangDetectException(Exception):
+        pass
+
+    def detect(text: str) -> str:
+        if not text or len(str(text).strip()) < 5:
+            return 'unknown'
+        s = str(text).lower()
+        # Arabic unicode range heuristic
+        if any('\u0600' <= ch <= '\u06FF' for ch in s):
+            return 'ar'
+        # simple keyword heuristics for western languages
+        en_words = [' the ', ' and ', ' of ', ' to ', ' in ', ' is ', ' for ']
+        fr_words = [' le ', ' la ', ' les ', ' de ', ' des ', ' que ', ' pour ', ' avec ']
+        es_words = [' el ', ' la ', ' los ', ' las ', ' de ', ' que ', ' para ', ' con ']
+        pt_words = [' que ', ' para ', ' com ', ' por ', ' não ', ' mais ']
+
+        scores = {'en': 0, 'fr': 0, 'es': 0, 'pt': 0}
+        for w in en_words:
+            if w in s:
+                scores['en'] += 1
+        for w in fr_words:
+            if w in s:
+                scores['fr'] += 1
+        for w in es_words:
+            if w in s:
+                scores['es'] += 1
+        for w in pt_words:
+            if w in s:
+                scores['pt'] += 1
+
+        best = max(scores.items(), key=lambda x: x[1])
+        if best[1] == 0:
+            return 'unknown'
+        return best[0]
+
+    class _FakeProb:
+        def __init__(self, lang, prob):
+            self.lang = lang
+            self.prob = prob
+
+    def detect_langs(text: str):
+        lang = detect(text)
+        return [_FakeProb(lang, 0.85)]
 from collections import Counter
+
+# Optional fastText support for higher-accuracy language detection
+try:
+    import fasttext
+except Exception:
+    fasttext = None
+
+# Try langid as a higher-quality pure-Python fallback
+try:
+    import langid
+except Exception:
+    langid = None
 
 class LanguageAnalyzer:
     """
@@ -54,6 +112,27 @@ class LanguageAnalyzer:
             'mBERT': ['en', 'fr', 'ar', 'pt', 'sw', 'am', 'ha', 'yo', 'ig', 'zu', 'af', 'so'],
             'XLM-RoBERTa': ['en', 'fr', 'ar', 'pt', 'sw', 'am', 'ha', 'yo', 'ig', 'zu', 'af', 'so']
         }
+        # fastText model placeholder
+        self.ft_model = None
+        self.ft_model_path = None
+        # If fasttext is available, look for a local lid model
+        if fasttext is not None:
+            possible = [
+                os.path.join('models', 'lid.176.bin'),
+                os.path.join('models', 'lid.176.ftz'),
+                os.path.join('data', 'lid.176.bin'),
+                os.path.join('data', 'lid.176.ftz'),
+                'lid.176.bin',
+                'lid.176.ftz'
+            ]
+            for p in possible:
+                if os.path.exists(p):
+                    try:
+                        self.ft_model = fasttext.load_model(p)
+                        self.ft_model_path = p
+                        break
+                    except Exception:
+                        continue
     
     def detect_language(self, text: str) -> str:
         """
@@ -68,6 +147,14 @@ class LanguageAnalyzer:
         if pd.isna(text) or not text or len(str(text).strip()) < 10:
             return 'unknown'
         
+        # Prefer langid if available
+        if langid is not None:
+            try:
+                l, p = langid.classify(str(text))
+                return l
+            except Exception:
+                pass
+
         try:
             return detect(str(text))
         except LangDetectException:
@@ -86,6 +173,28 @@ class LanguageAnalyzer:
         if pd.isna(text) or not text or len(str(text).strip()) < 10:
             return ('unknown', 0.0)
         
+        # Prefer fastText if available and loaded
+        if self.ft_model is not None:
+            try:
+                # fastText returns labels like '__label__en'
+                preds, probs = self.ft_model.predict(str(text).replace('\n', ' '), k=1)
+                if preds and probs:
+                    lab = preds[0]
+                    prob = float(probs[0]) if probs[0] is not None else 0.0
+                    code = lab.replace('__label__', '')
+                    return (code, prob)
+            except Exception:
+                pass
+
+            # Next prefer langid if available
+            if langid is not None:
+                try:
+                    l, p = langid.classify(str(text))
+                    prob = float(p) if p is not None else 0.0
+                    return (l, prob)
+                except Exception:
+                    pass
+
         try:
             langs = detect_langs(str(text))
             if langs:
@@ -107,12 +216,32 @@ class LanguageAnalyzer:
         print(f"Analyzing languages in '{text_column}' column...")
         print(f"Total articles: {len(self.df)}")
         
+        # Prepare the text series to analyze. Accept a single column name or a list to combine.
+        if isinstance(text_column, (list, tuple)):
+            # combine multiple columns into one string per row
+            def join_cols(row):
+                parts = []
+                for col in text_column:
+                    if col in self.df.columns and pd.notna(row.get(col)):
+                        parts.append(str(row.get(col)))
+                return ' '.join(parts)
+
+            texts = self.df.apply(join_cols, axis=1)
+        else:
+            if text_column not in self.df.columns:
+                # fallback to description or other common fields
+                for fallback_col in ['description', 'summary', 'content']:
+                    if fallback_col in self.df.columns:
+                        text_column = fallback_col
+                        break
+            texts = self.df[text_column] if text_column in self.df.columns else pd.Series([''] * len(self.df))
+
         # Detect language for each text
         results = []
-        for idx, text in enumerate(self.df[text_column]):
+        for idx, text in enumerate(texts):
             if idx % 100 == 0:
                 print(f"  Processed {idx}/{len(self.df)} articles...", end='\r')
-            
+
             lang, confidence = self.detect_language_with_confidence(text)
             results.append({
                 'language_code': lang,
@@ -240,7 +369,14 @@ class LanguageAnalyzer:
         """
         if 'language_name' not in self.df.columns:
             raise ValueError("Run analyze_dataset() first to detect languages")
-        
+
+        # Import visualization libraries lazily so script can run without them
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+        except Exception as e:
+            raise RuntimeError('matplotlib and seaborn are required for visualization. Install them or skip visualization.') from e
+
         # Create figure with subplots
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         fig.suptitle('Language Distribution Analysis', fontsize=16, fontweight='bold')
@@ -354,7 +490,21 @@ class LanguageAnalyzer:
 
 if __name__ == "__main__":
     # Initialize analyzer with your collected data
-    analyzer = LanguageAnalyzer(data_path='african_news_clean.csv')
+    # default to the final merged dataset
+    candidates = [
+        os.path.join('data_csv', 'final_africa.csv'),
+        os.path.join('data', 'final_africa.csv'),
+        'final_africa.csv',
+        'african_news_clean.csv'
+    ]
+    analyzer = None
+    for p in candidates:
+        if os.path.exists(p):
+            analyzer = LanguageAnalyzer(data_path=p)
+            print(f"Using input file: {p}")
+            break
+    if analyzer is None:
+        raise SystemExit('No input dataset found (looked for final_africa.csv and african_news_clean.csv)')
     
     # Or if you already have a DataFrame:
     # analyzer = LanguageAnalyzer(dataframe=your_dataframe)
@@ -363,7 +513,16 @@ if __name__ == "__main__":
     print("=" * 60)
     print("STEP 1: Detecting Languages")
     print("=" * 60)
-    df_with_languages = analyzer.analyze_dataset(text_column='title')
+    # Use a combination of fields to improve detection accuracy when available
+    preferred_fields = [c for c in ['title', 'description', 'summary', 'content'] if c in analyzer.df.columns]
+    if not preferred_fields:
+        preferred_fields = ['title']
+    df_with_languages = analyzer.analyze_dataset(text_column=preferred_fields)
+    # Save detected languages to CSV
+    out_path = os.path.join('data', 'final_africa_with_languages.csv')
+    os.makedirs('data', exist_ok=True)
+    df_with_languages.to_csv(out_path, index=False)
+    print(f"\nSaved language-annotated dataset to: {out_path}")
     
     # Get language statistics
     print("\n" + "=" * 60)
@@ -391,7 +550,10 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("STEP 4: Creating Visualizations")
     print("=" * 60)
-    analyzer.visualize_languages(save_path='language_analysis.png')
+    try:
+        analyzer.visualize_languages(save_path='language_analysis.png')
+    except RuntimeError as e:
+        print('Skipping visualization:', str(e))
     
     # Get samples in different languages
     print("\n" + "=" * 60)
