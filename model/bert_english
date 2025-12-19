@@ -1,0 +1,535 @@
+"""
+BERT Fine-tuning for English-Only News Classification
+Handles only English articles with bert-base-uncased
+Uses FULL ARTICLES with 4 unfrozen layers and 6 epochs
+"""
+
+import pandas as pd
+import numpy as np
+from datasets import Dataset, DatasetDict
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding,
+    EarlyStoppingCallback
+)
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+import torch
+import warnings
+warnings.filterwarnings('ignore')
+
+class BERTEnglishClassifier:
+    """
+    BERT fine-tuning for English African news classification
+    Model: bert-base-uncased (English only)
+    Configuration: 4 unfrozen layers (8-11) + classifier, 6 epochs
+    """
+    
+    def __init__(self, num_labels: int = 6):
+        """
+        Initialize BERT classifier for English only
+        
+        Args:
+            num_labels: Number of topic categories (default: 6)
+        """
+        self.model_name = "bert-base-uncased"  # English-only BERT
+        self.num_labels = num_labels
+        
+        self.topic_labels = {
+            0: 'Economic Development',
+            1: 'Natural Resources & Energy',
+            2: 'War & Conflict',
+            3: 'Social Services',
+            4: 'Politics & Governance',
+            5: 'Art, Technology and Sport'
+        }
+        
+        print(f"Initializing BERT (English): {self.model_name}")
+        print(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+    
+    def filter_english_only(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Filter dataset to keep ONLY English articles
+        """
+        print("\n" + "="*60)
+        print("FILTERING FOR ENGLISH ARTICLES ONLY")
+        print("="*60)
+        
+        original_count = len(df)
+        
+        if 'language_code' not in df.columns and 'language' not in df.columns:
+            print("⚠️  No 'language_code' or 'language' column found. Assuming all articles are English.")
+            return df
+        
+        print(f"\nOriginal dataset: {original_count} articles")
+        
+        # Try language_code first, then language
+        if 'language_code' in df.columns:
+            print("\nLanguage distribution BEFORE filtering:")
+            print(df['language_code'].value_counts())
+            df_english = df[df['language_code'] == 'en'].copy()
+        elif 'language' in df.columns:
+            print("\nLanguage distribution BEFORE filtering:")
+            print(df['language'].value_counts())
+            # Handle various English indicators
+            df_english = df[df['language'].str.lower().isin(['en', 'eng', 'english'])].copy()
+        
+        removed = original_count - len(df_english)
+        print(f"\n✓ Kept {len(df_english)} English articles")
+        print(f"✗ Removed {removed} non-English articles")
+        
+        if len(df_english) == 0:
+            raise ValueError("No English articles found in dataset!")
+        
+        return df_english
+    
+    def prepare_dataset(self, csv_path: str,
+                       article_column: str = 'content',
+                       label_column: str = 'topic_id',
+                       max_samples_per_class: int = 3000,
+                       test_size: float = 0.15) -> DatasetDict:
+        """
+        Load and prepare English-only dataset using FULL ARTICLES
+        
+        Args:
+            csv_path: Path to CSV file
+            article_column: Column with full article text (default: 'content')
+            label_column: Column with label IDs (default: 'topic_id')
+            max_samples_per_class: Max samples per class (balance dataset)
+            test_size: Test split ratio
+        """
+        print("\n" + "="*60)
+        print("PREPARING ENGLISH-ONLY DATASET (FULL ARTICLES)")
+        print("="*60)
+        
+        df = pd.read_csv(csv_path)
+        df = df[df[label_column].notna()].copy()
+        
+        # Filter for English only
+        df = self.filter_english_only(df)
+        
+        # Determine article column
+        found_column = None
+        if article_column in df.columns:
+            found_column = article_column
+        else:
+            # Fallback search including common fields and 'title'
+            available_columns = ['content', 'article', 'text', 'body', 'description', 'summary', 'title']
+            for col in available_columns:
+                if col in df.columns:
+                    found_column = col
+                    break
+        
+        if found_column is None:
+            raise ValueError(f"No suitable text column found. Available columns: {df.columns.tolist()}")
+        
+        print(f"\n📰 Using column: '{found_column}' for full article text")
+        
+        # Use full article text
+        df['article_text'] = df[found_column].fillna("").astype(str)
+        
+        # Show statistics
+        avg_length = df['article_text'].str.len().mean()
+        median_length = df['article_text'].str.len().median()
+        print(f"  Average article length: {avg_length:.0f} characters")
+        print(f"  Median article length: {median_length:.0f} characters")
+        
+        # Balance classes
+        df_balanced = df.groupby(label_column).apply(
+            lambda x: x.sample(min(max_samples_per_class, len(x)), random_state=42)
+        ).reset_index(drop=True)
+        
+        print(f"\nOriginal English articles: {len(df)}")
+        print(f"Balanced: {len(df_balanced)} articles")
+        
+        # Show distribution
+        print("\nLabel distribution:")
+        for label_id, count in df_balanced[label_column].value_counts().sort_index().items():
+            label_name = self.topic_labels.get(int(label_id), 'Unknown')
+            print(f"  {label_id}: {label_name:<30} {count:>4}")
+        
+        # Split data
+        train_df, test_df = train_test_split(
+            df_balanced[['article_text', label_column]],
+            test_size=test_size,
+            stratify=df_balanced[label_column],
+            random_state=42
+        )
+        
+        # Rename columns for transformers
+        train_df = train_df.rename(columns={'article_text': 'text', label_column: 'label'})
+        test_df = test_df.rename(columns={'article_text': 'text', label_column: 'label'})
+        
+        # Convert labels to integers
+        train_df['label'] = train_df['label'].astype(int)
+        test_df['label'] = test_df['label'].astype(int)
+        
+        # Convert to Dataset
+        dataset = DatasetDict({
+            'train': Dataset.from_pandas(train_df.reset_index(drop=True)),
+            'test': Dataset.from_pandas(test_df.reset_index(drop=True))
+        })
+        
+        print(f"\nTrain: {len(dataset['train'])} | Test: {len(dataset['test'])}")
+        
+        return dataset
+    
+    def create_model(self):
+        """
+        Create BERT model with 4 UNFROZEN LAYERS (layers 8-11) + classifier
+        
+        Strategy: Freeze first 8 layers (0-7), train last 4 layers (8-11) + classifier
+        Optimized for English-only articles
+        """
+        print("\n" + "="*60)
+        print("CREATING BERT MODEL (4 UNFROZEN LAYERS)")
+        print("="*60)
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        
+        # Load model
+        model = AutoModelForSequenceClassification.from_pretrained(
+            self.model_name,
+            num_labels=self.num_labels,
+            id2label={i: label for i, label in self.topic_labels.items()},
+            label2id={label: i for i, label in self.topic_labels.items()}
+        )
+        
+        num_transformer_layers = len(model.bert.encoder.layer)  # 12 layers for BERT-base
+        freeze_until = 8  # Freeze first 8 layers, train last 4
+        
+        print(f"\nModel: bert-base-uncased (English only)")
+        print(f"Total transformer layers: {num_transformer_layers}")
+        print(f"\n🔒 Freeze strategy: First {freeze_until} layers frozen")
+        print(f"🔓 Training: Layers {freeze_until}-{num_transformer_layers-1} (4 layers) + classifier")
+        
+        # Freeze embeddings
+        for param in model.bert.embeddings.parameters():
+            param.requires_grad = False
+        
+        # Freeze first 8 layers (0-7)
+        for i in range(freeze_until):
+            for param in model.bert.encoder.layer[i].parameters():
+                param.requires_grad = False
+        
+        # Train last 4 layers (8-11)
+        for i in range(freeze_until, num_transformer_layers):
+            for param in model.bert.encoder.layer[i].parameters():
+                param.requires_grad = True
+        
+        # Ensure classifier is trainable
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+        
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        print(f"\nTotal parameters: {total_params:,}")
+        print(f"Trainable: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
+        
+        return model, tokenizer
+    
+    def tokenize_dataset(self, dataset: DatasetDict, tokenizer, max_length: int = 512):
+        """
+        Tokenize dataset with full article text
+        
+        Args:
+            dataset: Dataset to tokenize
+            tokenizer: Tokenizer
+            max_length: Max sequence length (512 for full articles)
+        """
+        print(f"\nTokenizing full articles (max_length={max_length})...")
+        print("⚠️  Note: Using 512 tokens to capture full article content")
+        
+        def tokenize_function(examples):
+            # Ensure text is a list of strings
+            texts = examples['text']
+            if not isinstance(texts, list):
+                texts = [texts]
+            # Convert any non-string values to strings
+            texts = [str(t) if t is not None else "" for t in texts]
+            
+            return tokenizer(
+                texts,
+                padding='max_length',
+                truncation=True,
+                max_length=max_length
+            )
+        
+        tokenized = dataset.map(tokenize_function, batched=True, remove_columns=['text'])
+        
+        print("✓ Tokenization complete")
+        return tokenized
+    
+    def train(self,
+             model,
+             tokenizer,
+             tokenized_dataset: DatasetDict,
+             output_dir: str = './bert_english_news',
+             epochs: int = 6,
+             batch_size: int = 8,
+             learning_rate: float = 2e-5,
+             warmup_ratio: float = 0.1,
+             weight_decay: float = 0.01,
+             early_stopping_patience: int = 3):
+        """
+        Train BERT model for 6 EPOCHS with full articles
+        
+        Args:
+            model: BERT model
+            tokenizer: Tokenizer
+            tokenized_dataset: Tokenized data
+            output_dir: Save location
+            epochs: Training epochs (FIXED at 6)
+            batch_size: Batch size (8 for full articles with 512 tokens)
+            learning_rate: Learning rate (2e-5 - standard BERT fine-tuning)
+            warmup_ratio: Warmup ratio (0.1 - standard)
+            weight_decay: Weight decay for regularization
+            early_stopping_patience: Early stopping patience (epochs)
+        """
+        print("\n" + "="*60)
+        print("TRAINING BERT (6 EPOCHS, FULL ARTICLES)")
+        print("="*60)
+        
+        # Metrics function
+        def compute_metrics(eval_pred):
+            predictions, labels = eval_pred
+            predictions = np.argmax(predictions, axis=1)
+            
+            precision, recall, f1, _ = precision_recall_fscore_support(
+                labels, predictions, average='weighted'
+            )
+            acc = accuracy_score(labels, predictions)
+            
+            return {
+                'accuracy': acc,
+                'f1': f1,
+                'precision': precision,
+                'recall': recall
+            }
+        
+        # Training arguments
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            learning_rate=learning_rate,
+            warmup_ratio=warmup_ratio,
+            weight_decay=weight_decay,
+            logging_steps=100,
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            load_best_model_at_end=True,
+            metric_for_best_model="f1",
+            greater_is_better=True,
+            fp16=torch.cuda.is_available(),
+            gradient_accumulation_steps=4,  # Effective batch size = 32
+            report_to="none",
+            save_total_limit=2,
+            dataloader_num_workers=2,
+            optim="adamw_torch"
+        )
+        
+        # Create trainer with early stopping
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_dataset['train'],
+            eval_dataset=tokenized_dataset['test'],
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics,
+            data_collator=DataCollatorWithPadding(tokenizer),
+            callbacks=[
+                EarlyStoppingCallback(
+                    early_stopping_patience=early_stopping_patience,
+                    early_stopping_threshold=0.001
+                )
+            ]
+        )
+        
+        print(f"\n📊 Training Configuration:")
+        print(f"  Epochs: {epochs} (FIXED)")
+        print(f"  Batch size: {batch_size} (effective: {batch_size * 4} with gradient accumulation)")
+        print(f"  Learning rate: {learning_rate}")
+        print(f"  Warmup ratio: {warmup_ratio}")
+        print(f"  Weight decay: {weight_decay}")
+        print(f"  Early stopping patience: {early_stopping_patience}")
+        print(f"  FP16: {'Enabled' if torch.cuda.is_available() else 'Disabled (CPU)'}")
+        print(f"  Unfrozen layers: 4 (layers 8-11) + classifier")
+        print("\n🚀 Starting training with FULL ARTICLES...")
+        
+        # Train
+        trainer.train()
+        
+        # Evaluate
+        print("\n" + "="*60)
+        print("EVALUATION")
+        print("="*60)
+        
+        results = trainer.evaluate()
+        
+        print(f"\nAccuracy:  {results['eval_accuracy']:.4f}")
+        print(f"F1 Score:  {results['eval_f1']:.4f}")
+        print(f"Precision: {results['eval_precision']:.4f}")
+        print(f"Recall:    {results['eval_recall']:.4f}")
+        
+        # Per-class performance
+        predictions = trainer.predict(tokenized_dataset['test'])
+        y_pred = np.argmax(predictions.predictions, axis=1)
+        y_true = predictions.label_ids
+        
+        print("\nPer-class performance:")
+        print(classification_report(
+            y_true,
+            y_pred,
+            target_names=list(self.topic_labels.values()),
+            digits=3
+        ))
+        
+        # Save model
+        print("\n" + "="*60)
+        print("SAVING MODEL")
+        print("="*60)
+        
+        trainer.save_model(output_dir)
+        tokenizer.save_pretrained(output_dir)
+        
+        print(f"✓ Model saved to: {output_dir}")
+        
+        return trainer
+    
+    def load_model(self, model_path: str):
+        """
+        Load trained model
+        
+        Args:
+            model_path: Path to saved model
+        """
+        print(f"\nLoading model from: {model_path}")
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForSequenceClassification.from_pretrained(model_path)
+        
+        print("✓ Model loaded")
+        return model, tokenizer
+    
+    def predict(self, model, tokenizer, texts: list) -> pd.DataFrame:
+        """
+        Predict topics for new English articles
+        
+        Args:
+            model: Trained model
+            tokenizer: Tokenizer
+            texts: List of article texts (English only)
+        
+        Returns:
+            DataFrame with predictions
+        """
+        print(f"\nPredicting for {len(texts)} English articles...")
+        
+        # Tokenize
+        inputs = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors='pt'
+        )
+        
+        # Move to device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = model.to(device)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # Predict
+        model.eval()
+        with torch.no_grad():
+            outputs = model(**inputs)
+            predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        
+        predicted_labels = predictions.argmax(dim=-1).cpu().numpy()
+        confidences = predictions.max(dim=-1).values.cpu().numpy()
+        
+        # Create results
+        results = pd.DataFrame({
+            'text': texts,
+            'predicted_label_id': predicted_labels,
+            'predicted_label_name': [self.topic_labels[lid] for lid in predicted_labels],
+            'confidence': confidences
+        })
+        
+        print("✓ Predictions complete")
+        return results
+
+
+# ==================== QUICK WORKFLOW ====================
+
+def train_bert_english():
+    """
+    Complete workflow for training BERT on English articles only
+    Configuration: Full articles, 4 unfrozen layers, 6 epochs
+    """
+    print("="*60)
+    print("BERT ENGLISH-ONLY CLASSIFIER")
+    print("FULL ARTICLES • 4 UNFROZEN LAYERS • 6 EPOCHS")
+    print("="*60)
+    print("\n⚡ Configuration:")
+    print("  • Reading FULL ARTICLES (not just titles)")
+    print("  • 4 unfrozen layers (8-11) + classifier")
+    print("  • 6 epochs training (FIXED)")
+    print("  • Max length: 512 tokens (full article context)")
+    print("  • Batch size: 8 (effective 32 with gradient accumulation)")
+    print("  • English articles only")
+    print("\n🎯 Expected: Better performance with full article content\n")
+    
+    # Initialize
+    classifier = BERTEnglishClassifier(num_labels=6)
+    
+    # Prepare dataset from world_newsE_train.csv (titles as text)
+    from pathlib import Path
+    train_csv = str(Path(__file__).resolve().parent.parent / 'data_world' / 'world_newsE_train.csv')
+    dataset = classifier.prepare_dataset(
+        train_csv,
+        article_column='title',
+        label_column='topic_id',
+        max_samples_per_class=3000,
+        test_size=0.15
+    )
+    
+    # Create model with 4 UNFROZEN LAYERS
+    model, tokenizer = classifier.create_model()
+    
+    # Tokenize with full 512 tokens for articles
+    tokenized_dataset = classifier.tokenize_dataset(dataset, tokenizer, max_length=512)
+    
+    # Train for 6 EPOCHS
+    trainer = classifier.train(
+        model,
+        tokenizer,
+        tokenized_dataset,
+        output_dir='./bert_english_full_articles',
+        epochs=6,              # FIXED at 6 epochs
+        batch_size=8,          # Reduced for 512 token sequences
+        learning_rate=2e-5,
+        warmup_ratio=0.1,
+        weight_decay=0.01,
+        early_stopping_patience=3
+    )
+    
+    print("\n" + "="*60)
+    print("✓ TRAINING COMPLETE!")
+    print("="*60)
+    print("\nModel saved to: ./bert_english_full_articles")
+    print("\nTo use later:")
+    print("  classifier = BERTEnglishClassifier()")
+    print("  model, tokenizer = classifier.load_model('./bert_english_full_articles')")
+    print("  predictions = classifier.predict(model, tokenizer, ['Full article text...'])")
+
+
+if __name__ == "__main__":
+    train_bert_english()
