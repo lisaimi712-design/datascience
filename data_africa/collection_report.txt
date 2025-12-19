@@ -1,0 +1,40 @@
+AFRICAN NEWS COLLECTION REPORT
+============================================================
+
+Total articles: 14165
+
+By source:
+source
+GDELT          14036
+African RSS      129
+Name: count, dtype: int64
+
+By country:
+country
+Mauritius                673
+Kenya                    658
+South Africa             653
+Madagascar               647
+Malawi                   597
+Comoros                  596
+Somalia                  589
+Tanzania                 581
+Zimbabwe                 577
+Gabon                    575
+Zambia                   575
+South Sudan              574
+Ethiopia                 566
+Seychelles               562
+Mozambique               561
+Uganda                   553
+Rwanda                   552
+Burundi                  536
+Namibia                  534
+Botswana                 502
+Djibouti                 497
+Eritrea                  495
+Lesotho                  470
+Sao Tome and Principe    455
+Eswatini                 364
+Equatorial Guinea         94
+Name: count, dtype: int64
